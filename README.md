@@ -1,8 +1,8 @@
 # THE WORLD IN ONE DAY — Sunday 22 November 2026
 
-[![Competition](https://img.shields.io/badge/make.fun-news--image--20261122-1a2a4a)](https://make.fun/bounty/news-image-20261122)
-[![Entry](https://img.shields.io/badge/entry-35_stories_%C2%B7_7_regions-b22222)](https://make.fun/bounty/news-image-20261122)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![make.fun · news-image-20261122](https://make.fun/badge/news-image-20261122.svg)](https://make.fun/bounty/news-image-20261122?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261122)
+[![rank](https://make.fun/badge/news-image-20261122/fearxfx22/news-image-20261122/rank.svg)](https://make.fun/bounty/news-image-20261122/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261122)
+[![reward](https://make.fun/badge/news-image-20261122/fearxfx22/news-image-20261122/reward.svg)](https://make.fun/bounty/news-image-20261122?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261122)
 
 A one-page front-page infographic summing up the world's news of
 **Sunday 22 November 2026** — 35 stories across 7 regions, every one dated
