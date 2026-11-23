@@ -12,13 +12,23 @@ import os
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 1024, 1024
-FONT_DIR = "/usr/share/fonts/truetype/liberation"
+# Fonts ship with the entry (fonts/) so the render does not depend on the
+# grader image carrying them; the system path is the fallback.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FONT_DIRS = (
+    os.path.join(_HERE, "fonts"),
+    "/usr/share/fonts/truetype/liberation",
+)
 
 OUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "out")
 
 
 def _font(name, size):
-    return ImageFont.truetype(os.path.join(FONT_DIR, name), size)
+    for d in _FONT_DIRS:
+        path = os.path.join(d, name)
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
 
 
 def serif_b(s):
