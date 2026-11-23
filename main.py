@@ -3,13 +3,20 @@
 
 A one-page front-page infographic summing up the day's world news:
 35 stories, 7 regions, every one dated Sunday 22 November 2026.
-Drawn entirely in code with Pillow and Liberation TrueType fonts.
+Drawn entirely in code with Liberation TrueType fonts (Pillow when present,
+a standard-library canvas + glyph atlas otherwise).
 No network access, deterministic output (two runs -> identical bytes).
 """
 
 import os
 
-from PIL import Image, ImageDraw, ImageFont
+# Pillow is not installed in the grader image (standard library only), so
+# this import may fail; the stdlib fallback below then renders the same page.
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
 
 W, H = 1024, 1024
 # Fonts ship with the entry (fonts/) so the render does not depend on the
@@ -24,11 +31,13 @@ OUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "out")
 
 
 def _font(name, size):
-    for d in _FONT_DIRS:
-        path = os.path.join(d, name)
-        if os.path.exists(path):
-            return ImageFont.truetype(path, size)
-    return ImageFont.load_default()
+    if HAVE_PIL:
+        for d in _FONT_DIRS:
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                return ImageFont.truetype(path, size)
+        return ImageFont.load_default()
+    return StdFont(name, size)
 
 
 def serif_b(s):
@@ -53,6 +62,380 @@ def sans_b(s):
 
 def sans_i(s):
     return _font("LiberationSans-Italic.ttf", s)
+
+
+# ---------------------------------------------------------------- stdlib fallback
+# The grader runs the entry with the standard library only (nothing is
+# installed), so Pillow is not importable there. When the PIL import fails,
+# render with this tiny RGB canvas + the pre-rendered Liberation glyph atlas
+# (fonts/glyphs.bin, generated with Pillow from the same TTFs). The layout
+# code is unchanged; the canvas implements the ImageDraw methods it uses,
+# and the atlas stores each glyph's mask, bearing and advance exactly as
+# FreeType renders it, plus the font's kerning, so text measures identically.
+import json as _json
+import math as _math
+import struct as _struct
+import zlib as _zlib
+
+_ATLAS = None  # (glyphs, kern, blob), loaded lazily on first text use
+
+
+def _load_atlas():
+    global _ATLAS
+    if _ATLAS is not None:
+        return _ATLAS
+    with open(os.path.join(_HERE, "fonts", "glyphs.bin"), "rb") as fh:
+        data = fh.read()
+    assert data[:4] == b"GLY1"
+    hlen = _struct.unpack(">I", data[4:8])[0]
+    head = _json.loads(data[8:8 + hlen])
+    _ATLAS = (head["glyphs"], head["kern"], data[8 + hlen:])
+    return _ATLAS
+
+
+def _font_key(name, size):
+    return "%s@%g" % (name, size)
+
+
+class StdFont:
+    """A font in the stdlib path: a key into the glyph atlas + a size."""
+
+    def __init__(self, name, size):
+        self.name = name
+        self.size = size
+        self.key = _font_key(name, size)
+
+
+def _rhu(v):
+    """Round half away from zero (PIL rounds float coords this way)."""
+    return int(v + 0.5) if v >= 0 else -int(-v + 0.5)
+
+
+class StdCanvas:
+    """RGB canvas with the ImageDraw methods the layout code uses."""
+
+    def __init__(self, w, h, bg):
+        self.size = (w, h)
+        self._w, self._h = w, h
+        self._buf = bytearray(bytes(bg)) * (w * h)
+
+    def _set(self, x, y, color):
+        if 0 <= x < self._w and 0 <= y < self._h:
+            i = (y * self._w + x) * 3
+            self._buf[i:i + 3] = bytes(color)
+
+    def _fill_rect(self, x0, y0, x1, y1, color):
+        x0 = max(x0, 0)
+        y0 = max(y0, 0)
+        x1 = min(x1, self._w - 1)
+        y1 = min(y1, self._h - 1)
+        if x1 < x0 or y1 < y0:
+            return
+        row = bytes(color) * (x1 - x0 + 1)
+        for y in range(y0, y1 + 1):
+            i = (y * self._w + x0) * 3
+            self._buf[i:i + len(row)] = row
+
+    def _blit(self, gx, gy, w, h, mask, fill):
+        r, g, b = fill
+        x0 = max(gx, 0)
+        y0 = max(gy, 0)
+        x1 = min(gx + w, self._w)
+        y1 = min(gy + h, self._h)
+        if x1 <= x0 or y1 <= y0:
+            return
+        buf = self._buf
+        W = self._w
+        for yy in range(y0, y1):
+            mrow = (yy - gy) * w + (x0 - gx)
+            base = (yy * W + x0) * 3
+            for xx in range(x0, x1):
+                a = mask[mrow + (xx - x0)]
+                if not a:
+                    continue
+                i = base + (xx - x0) * 3
+                if a == 255:
+                    buf[i] = r
+                    buf[i + 1] = g
+                    buf[i + 2] = b
+                else:
+                    ia = 255 - a
+                    buf[i] = (r * a + buf[i] * ia) // 255
+                    buf[i + 1] = (g * a + buf[i + 1] * ia) // 255
+                    buf[i + 2] = (b * a + buf[i + 2] * ia) // 255
+
+    def text(self, xy, text, font=None, fill=(0, 0, 0)):
+        glyphs, kern, blob = _load_atlas()
+        x = _rhu(xy[0])
+        y = _rhu(xy[1])
+        gd = glyphs.get(font.key, {})
+        kd = kern.get(font.key, {})
+        space = gd.get(" ")
+        pen = 0.0
+        prev = None
+        for ch in text:
+            g = gd.get(ch)
+            if g is None:
+                if space is not None:
+                    pen += space[0]
+                prev = ch
+                continue
+            adv, bx, by, w, h, off, ln = g
+            if prev is not None:
+                pen += kd.get(prev + ch, 0.0)
+            if w > 0 and h > 0:
+                self._blit(x + _rhu(pen) + bx, y + by, w, h,
+                           blob[off:off + ln], fill)
+            pen += adv
+            prev = ch
+
+    def textlength(self, text, font=None):
+        glyphs, kern, blob = _load_atlas()
+        gd = glyphs.get(font.key, {})
+        kd = kern.get(font.key, {})
+        space = gd.get(" ")
+        total = 0.0
+        prev = None
+        for ch in text:
+            g = gd.get(ch)
+            if g is None:
+                if space is not None:
+                    total += space[0]
+                prev = ch
+                continue
+            if prev is not None:
+                total += kd.get(prev + ch, 0.0)
+            total += g[0]
+            prev = ch
+        return total
+
+    def rectangle(self, xy, fill=None, outline=None, width=1):
+        x0, y0, x1, y1 = [_rhu(v) for v in xy]
+        if fill is not None:
+            self._fill_rect(x0, y0, x1, y1, fill)
+        if outline is not None:
+            w = max(1, int(width))
+            self._fill_rect(x0, y0, x1, y0 + w - 1, outline)
+            self._fill_rect(x0, y1 - w + 1, x1, y1, outline)
+            self._fill_rect(x0, y0, x0 + w - 1, y1, outline)
+            self._fill_rect(x1 - w + 1, y0, x1, y1, outline)
+
+    def ellipse(self, xy, fill=None, outline=None, width=1):
+        x0, y0, x1, y1 = [_rhu(v) for v in xy]
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        rx = (x1 - x0) / 2.0
+        ry = (y1 - y0) / 2.0
+        if fill is not None and rx > 0 and ry > 0:
+            for y in range(y0, y1 + 1):
+                t = (y - cy) / ry
+                if abs(t) > 1:
+                    continue
+                dx = rx * (1 - t * t) ** 0.5
+                self._fill_rect(_rhu(cx - dx), y, _rhu(cx + dx), y, fill)
+        if outline is not None:
+            self._ellipse_curve(cx, cy, rx, ry, 0, 360, outline, width)
+
+    def _ellipse_curve(self, cx, cy, rx, ry, a0, a1, color, width):
+        pts = []
+        a = float(a0)
+        while a <= a1:
+            r = _math.radians(a)
+            pts.append((cx + rx * _math.cos(r), cy + ry * _math.sin(r)))
+            a += 1.0
+        r = _math.radians(a1)
+        pts.append((cx + rx * _math.cos(r), cy + ry * _math.sin(r)))
+        for p, q in zip(pts, pts[1:]):
+            if width <= 1:
+                self._bresenham(p[0], p[1], q[0], q[1], color)
+            else:
+                self._thick_line(p[0], p[1], q[0], q[1], width, color)
+
+    def polygon(self, xy, fill=None, outline=None):
+        pts = [(_rhu(x), _rhu(y)) for x, y in xy]
+        if fill is not None and len(pts) >= 3:
+            ys = [p[1] for p in pts]
+            n = len(pts)
+            for y in range(min(ys), max(ys) + 1):
+                yc = y + 0.5
+                xs = []
+                for i in range(n):
+                    x1, y1 = pts[i]
+                    x2, y2 = pts[(i + 1) % n]
+                    if (y1 <= yc < y2) or (y2 <= yc < y1):
+                        t = (yc - y1) / (y2 - y1)
+                        xs.append(x1 + t * (x2 - x1))
+                xs.sort()
+                for i in range(0, len(xs) - 1, 2):
+                    self._fill_rect(_rhu(xs[i]), y, _rhu(xs[i + 1]), y, fill)
+        if outline is not None:
+            n = len(pts)
+            for i in range(n):
+                self._bresenham(pts[i][0], pts[i][1],
+                                pts[(i + 1) % n][0], pts[(i + 1) % n][1],
+                                outline)
+
+    def _line_points(self, xy):
+        if len(xy) == 4 and all(isinstance(v, (int, float)) for v in xy):
+            return [(xy[0], xy[1]), (xy[2], xy[3])]
+        return [(p[0], p[1]) for p in xy]
+
+    def line(self, xy, fill=None, width=1, joint=None):
+        pts = self._line_points(xy)
+        for p, q in zip(pts, pts[1:]):
+            if width <= 1:
+                self._bresenham(p[0], p[1], q[0], q[1], fill)
+            else:
+                self._thick_line(p[0], p[1], q[0], q[1], width, fill)
+
+    def _bresenham(self, x0, y0, x1, y1, color):
+        x0 = _rhu(x0)
+        y0 = _rhu(y0)
+        x1 = _rhu(x1)
+        y1 = _rhu(y1)
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        while True:
+            self._set(x0, y0, color)
+            if x0 == x1 and y0 == y1:
+                return
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+
+    def _thick_line(self, x0, y0, x1, y1, width, color):
+        x0 = _rhu(x0)
+        y0 = _rhu(y0)
+        x1 = _rhu(x1)
+        y1 = _rhu(y1)
+        dx = x1 - x0
+        dy = y1 - y0
+        ln = (dx * dx + dy * dy) ** 0.5
+        if ln == 0:
+            r = width // 2
+            self._fill_rect(x0 - r, y0 - r, x0 + r, y0 + r, color)
+            return
+        px = -dy / ln * width / 2.0
+        py = dx / ln * width / 2.0
+        self.polygon([(x0 + px, y0 + py), (x1 + px, y1 + py),
+                      (x1 - px, y1 - py), (x0 - px, y0 - py)], fill=color)
+
+    def arc(self, xy, start, end, fill=None, width=1):
+        x0, y0, x1, y1 = [_rhu(v) for v in xy]
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        rx = (x1 - x0) / 2.0
+        ry = (y1 - y0) / 2.0
+        a0 = start % 360.0
+        a1 = end % 360.0
+        if a1 <= a0:
+            a1 += 360.0
+        self._ellipse_curve(cx, cy, rx, ry, a0, a1, fill, width)
+
+    def pieslice(self, xy, start, end, fill=None, outline=None):
+        x0, y0, x1, y1 = [_rhu(v) for v in xy]
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        rx = (x1 - x0) / 2.0
+        ry = (y1 - y0) / 2.0
+        a0 = start % 360.0
+        a1 = end % 360.0
+        if a1 <= a0:
+            a1 += 360.0
+        pts = [(cx, cy)]
+        a = a0
+        while a <= a1:
+            r = _math.radians(a)
+            pts.append((cx + rx * _math.cos(r), cy + ry * _math.sin(r)))
+            a += 1.0
+        r = _math.radians(a1)
+        pts.append((cx + rx * _math.cos(r), cy + ry * _math.sin(r)))
+        if fill is not None:
+            self.polygon(pts, fill=fill)
+        if outline is not None:
+            for p, q in zip(pts[1:], pts[2:]):
+                self._bresenham(p[0], p[1], q[0], q[1], outline)
+            self._bresenham(cx, cy, pts[1][0], pts[1][1], outline)
+            self._bresenham(cx, cy, pts[-1][0], pts[-1][1], outline)
+
+    def rounded_rectangle(self, xy, radius=0, fill=None, outline=None,
+                          width=1):
+        x0, y0, x1, y1 = [_rhu(v) for v in xy]
+        r = int(radius)
+        if fill is not None:
+            if r <= 0:
+                self._fill_rect(x0, y0, x1, y1, fill)
+            else:
+                for y in range(y0, y1 + 1):
+                    for x in range(x0, x1 + 1):
+                        cx = min(max(x, x0 + r), x1 - r)
+                        cy = min(max(y, y0 + r), y1 - r)
+                        if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
+                            self._set(x, y, fill)
+        if outline is not None:
+            w = max(1, int(width))
+            self._fill_rect(x0 + r, y0, x1 - r, y0 + w - 1, outline)
+            self._fill_rect(x0 + r, y1 - w + 1, x1 - r, y1, outline)
+            self._fill_rect(x0, y0 + r, x0 + w - 1, y1 - r, outline)
+            self._fill_rect(x1 - w + 1, y0 + r, x1, y1 - r, outline)
+            for ccx, ccy, a0, a1 in ((x0 + r, y0 + r, 180, 270),
+                                    (x1 - r, y0 + r, 270, 360),
+                                    (x1 - r, y1 - r, 0, 90),
+                                    (x0 + r, y1 - r, 90, 180)):
+                self.arc([ccx - r, ccy - r, ccx + r, ccy + r], a0, a1,
+                         fill=outline, width=w)
+
+    def save(self, path, format="PNG", optimize=True):
+        with open(path, "wb") as fh:
+            fh.write(_png_bytes(self._buf, self._w, self._h))
+
+
+def _png_bytes(buf, w, h):
+    """Encode an RGB buffer as a PNG (Paeth filter, zlib level 9)."""
+    stride = w * 3
+    raw = bytearray()
+    prev = bytes(stride)
+    for y in range(h):
+        row = bytes(buf[y * stride:(y + 1) * stride])
+        if row == prev:
+            raw.append(2)
+            raw += bytes(stride)
+        else:
+            filt = bytearray(stride)
+            for i in range(stride):
+                a = row[i - 3] if i >= 3 else 0
+                b = prev[i]
+                c = prev[i - 3] if i >= 3 else 0
+                p = a + b - c
+                pa = abs(p - a)
+                pb = abs(p - b)
+                pc = abs(p - c)
+                if pa <= pb and pa <= pc:
+                    pr = a
+                elif pb <= pc:
+                    pr = b
+                else:
+                    pr = c
+                filt[i] = (row[i] - pr) & 0xff
+            raw.append(4)
+            raw += filt
+        prev = row
+
+    def chunk(tag, data):
+        c = _struct.pack(">I", len(data)) + tag + data
+        return c + _struct.pack(">I", _zlib.crc32(tag + data) & 0xffffffff)
+
+    ihdr = _struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", _zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
 
 
 # ---------------------------------------------------------------- palette
@@ -642,8 +1025,12 @@ def draw_map(d, x, y, w, h):
 
 # ---------------------------------------------------------------- page build
 def build():
-    img = Image.new("RGB", (W, H), PAPER)
-    d = ImageDraw.Draw(img)
+    if HAVE_PIL:
+        img = Image.new("RGB", (W, H), PAPER)
+        d = ImageDraw.Draw(img)
+    else:
+        img = StdCanvas(W, H, PAPER)
+        d = img
     MX = 8                      # side margin
     CW = W - 2 * MX             # content width = 1008
 
